@@ -1,0 +1,73 @@
+# cargo-deny configuration for Coral.
+#
+# Run locally: `cargo deny --all-features check`.
+# CI runs this on every push/PR via .github/workflows/ci.yml.
+#
+# Goals:
+#  - Allow only OSI-approved permissive licenses (MIT/Apache style).
+#  - Catch duplicate versions of the same crate (multiple semver-incompatible
+#    copies bloat the binary; one or two are usually unavoidable from
+#    transitive deps, so we warn rather than deny).
+#  - Block known security advisories on direct deps (cargo-audit also runs
+#    in a separate job for the broader transitive view).
+
+[graph]
+all-features = true
+
+[output]
+feature-depth = 1
+
+[advisories]
+yanked = "warn"
+# v0.39.0 closure: RUSTSEC-2025-0141 (bincode unmaintained) ignore
+# removed. `coral-core::search_index` now serializes via postcard 1.x
+# (BACKLOG #7). The advisory previously gated CI; with bincode out of
+# the dependency graph entirely, no ignore is required. Add new
+# entries here only with a written rationale (and a follow-up
+# CHANGELOG note when they're dropped).
+ignore = []
+
+[licenses]
+# Spell each allowed license explicitly. Add as needed; grep-able log.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    # `webpki-roots` switched from MPL-2.0 → CDLA-Permissive-2.0 in newer
+    # releases (it ships Mozilla's CA trust store, distributed under
+    # Linux Foundation's Community Data License Agreement). The license
+    # is OSI-permissive: no copyleft, redistribution allowed, no
+    # patent grant ambiguity. We pull `webpki-roots` transitively via
+    # `ureq` (FR-ONB-27, 1-token provider ping) and via `rustls`.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+# A few duplicates are unavoidable as the ecosystem migrates major
+# versions (e.g. base64, syn 1 vs 2). Surface them as warnings, don't
+# block PRs.
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+# Hand-curated allowlist for known/expected duplicates. Empty for now;
+# add `{ name = "foo" }` entries when transitive deps unavoidably ship
+# multiple semver-incompatible copies.
+skip = []
+
+[sources]
+# Disallow git deps not pinned to a tag/rev — drift risk.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

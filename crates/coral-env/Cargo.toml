@@ -1,0 +1,40 @@
+[package]
+name = "coral-env"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Coral env: pluggable backend for dev environments (compose, kind, tilt)."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+chrono = { workspace = true }
+# v0.23.0: chaos scenario `attributes` are typed `BTreeMap<String, toml::Value>`
+# so users can write `attributes = { latency = 500, jitter = 50 }` in
+# `coral.toml` and the values pass through to the toxiproxy admin API
+# without a hand-rolled `enum AttributeValue { Int, String, Bool }`.
+# toml was already a dev-dep; promoting to a regular dep adds nothing
+# to the workspace tree.
+toml = { workspace = true }
+coral-core = { workspace = true }
+
+[features]
+default = ["compose"]
+compose = []
+# kind = []   # v0.20+
+# tilt = []   # v0.20+
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# v0.35 Phase C — inherit workspace clippy lints (unwrap/expect/panic
+# = warn). Surfaces panic-risk sites without breaking CI.
+[lints]
+workspace = true

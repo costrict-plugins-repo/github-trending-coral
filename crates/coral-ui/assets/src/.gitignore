@@ -1,0 +1,15 @@
+node_modules
+dist
+.DS_Store
+*.local
+.vite
+.cache
+*.log
+.env
+.env.*
+!.env.example
+# Playwright artifacts (local-only — see e2e/README.md).
+playwright-report
+test-results
+/blob-report
+playwright/.cache

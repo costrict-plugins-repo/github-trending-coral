@@ -1,0 +1,125 @@
+[package]
+name = "coral-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Coral CLI — LLM Wiki maintainer."
+
+[lib]
+name = "coral_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "coral"
+path = "src/main.rs"
+
+[dependencies]
+mimalloc = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+include_dir = { workspace = true }
+toml = { workspace = true }
+tempfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+chrono = { workspace = true }
+walkdir = { workspace = true }
+regex = { workspace = true }
+rayon = { workspace = true }
+# v0.34.0 onboarding (FR-ONB-30): lockfile + atomic write for
+# `.wiki/.bootstrap-state.json` checkpoints. fs4 is already a
+# workspace dep (used by coral-core::atomic); promoting consumes
+# zero extra dependencies.
+fs4 = { workspace = true }
+# v0.35 SEC-01: auto-mint a 256-bit CSPRNG bearer token when the
+# operator runs `coral mcp serve --transport http` on a non-loopback
+# bind without `--token`. Phase C hoisted the actual mint to
+# `coral_core::auth::mint_bearer_token`, so this crate's direct `rand`
+# dep is no longer needed (transitively still present via coral-core +
+# coral-mcp, both of which call it). Dropped to keep the dep graph
+# honest — if a future caller in this crate needs `rand` again, re-
+# add the line.
+# v0.34.0 onboarding (FR-ONB-30): SHA-256 fingerprint of the bootstrap
+# plan persisted in the checkpoint. Lets --resume detect when the
+# plan changed between runs and refuse to silently overwrite.
+sha2 = { workspace = true }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+# v0.34.0 onboarding (FR-ONB-6, FR-ONB-7): derives `JsonSchema` for the
+# `SelfCheck` struct so `coral self-check --print-schema` emits a
+# pin-able JSON Schema. Shared workspace pin already includes the
+# chrono feature we need for the DateTime<Utc> fields.
+schemars = { workspace = true }
+# v0.34.0 onboarding (FR-ONB-27, FR-ONB-33): `Confirm` (uninstall
+# safety prompt) and `Select`/`Password` (provider mini-wizard in
+# week 3). Optional via the `tty` feature in case downstream
+# packagers want a TTY-free build later — not gated for now.
+dialoguer = { workspace = true }
+# v0.34.0 onboarding (FR-ONB-27): synchronous 1-token ping to the
+# provider HTTP endpoint inside the `coral doctor --wizard` mini-
+# wizard. We verify the API key the user just pasted actually works
+# (HTTP 200) before persisting it to `.coral/config.toml`. `ureq`
+# is sync + small (~150 KB) so we avoid pulling tokio for what is
+# literally one POST per provider.
+ureq = { workspace = true }
+zip = { workspace = true }
+# v0.23.1: SIGINT/SIGTERM clean-shutdown plumbing for `coral monitor up`.
+signal-hook = { workspace = true }
+# v0.32.0: REST API + embedded SPA for `coral ui serve`. Behind the
+# `ui` feature so a minimal `--no-default-features` build still
+# yields a single-binary CLI without HTTP plumbing.
+coral-ui = { workspace = true, optional = true }
+coral-core = { workspace = true }
+coral-env = { workspace = true }
+coral-graph = { workspace = true }
+coral-implement = { workspace = true }
+coral-index = { workspace = true }
+coral-lint = { workspace = true }
+coral-mcp = { workspace = true }
+coral-runner = { workspace = true }
+coral-search = { workspace = true }
+coral-session = { workspace = true }
+coral-stats = { workspace = true }
+coral-test = { workspace = true }
+
+[features]
+default = ["ui"]
+# v0.32.0: `coral ui serve` (REST API + SPA). Default-on for plug-and-
+# play UX. Strip with `--no-default-features` for a minimal single-
+# binary CLI without HTTP plumbing.
+#
+# The legacy `webui` feature (gating `coral wiki serve`) was removed
+# in v0.38.0 after a 3-version deprecation window (announced v0.34.1).
+# `coral ui serve` is the modern replacement (same defaults).
+ui = ["dep:coral-ui"]
+# v0.23.2: enables `coral test record` (Linux-only Keploy capture).
+# Forwards to `coral-test/recorded` so the parser+replay path stays
+# always-on while the capture-side privileged work is opt-in. Build
+# with `cargo install --features recorded` on a Linux host to get
+# the capture subcommand. The replay path (`coral test --kind
+# recorded`) is shipped on every platform without the feature.
+recorded = ["coral-test/recorded"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+insta = { version = "1", features = ["yaml", "filters"] }
+zip = { workspace = true }
+
+# v0.34.0 onboarding (FR-ONB-32 Windows path): `MoveFileExW` for the
+# rename-then-replace dance `coral self-upgrade` does on Windows
+# (the running .exe can't be overwritten directly while it executes).
+# cfg-gated to windows targets so other platforms don't pay for it.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
+# v0.35 Phase C — inherit workspace clippy lints (unwrap/expect/panic
+# = warn). Surfaces panic-risk sites without breaking CI.
+[lints]
+workspace = true

@@ -1,0 +1,605 @@
+//! `WikiLog` — append-only operation log for the Coral wiki.
+
+use crate::error::{CoralError, Result};
+use chrono::{DateTime, Utc};
+use regex::Regex;
+use std::fs;
+use std::io::Write as _;
+use std::path::Path;
+use std::sync::OnceLock;
+
+/// Single log entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogEntry {
+    pub timestamp: DateTime<Utc>,
+    pub op: String,
+    pub summary: String,
+}
+
+/// Append-only log of operations on the wiki.
+#[derive(Debug, Clone, Default)]
+pub struct WikiLog {
+    pub entries: Vec<LogEntry>,
+}
+
+// v0.36 clippy: the regex literal is a `&'static str` parsed once
+// during `OnceLock::get_or_init`. A failure would be a programmer
+// error in the literal, not a runtime input error — panic-at-startup
+// is the right contract. The three `cap.get(N).expect(...)` calls in
+// `parse()` below are reached only inside `re.captures(line).is_some()`
+// AND every group is mandatory (no `(...)?`), so the Option is
+// statically Some.
+#[allow(clippy::expect_used)]
+fn log_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Accept both `Z` and `+HH:MM` / `-HH:MM` offsets so we round-trip our own output
+        // (chrono's `to_rfc3339()` emits `+00:00`, not `Z`).
+        Regex::new(
+            r"^- (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})) (\w[\w-]*): (.+)$",
+        )
+        .expect("valid log regex")
+    })
+}
+
+/// v0.19.8 #33: returns `true` when `op` matches the on-disk log v1
+/// format's `\w[\w-]*` constraint — single ASCII-alnum / `_`/`-`
+/// token, no whitespace, no leading hyphen. `WikiLog::append_atomic`
+/// debug-asserts on this; mismatches would otherwise silently drop
+/// the line on the next `WikiLog::parse`.
+fn is_valid_op_name(op: &str) -> bool {
+    let bytes = op.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    // Regex `\w` ≡ `[A-Za-z0-9_]`; first char must be `\w`, NOT `-`.
+    let first = bytes[0];
+    if !(first.is_ascii_alphanumeric() || first == b'_') {
+        return false;
+    }
+    // Subsequent chars: `\w` or `-`.
+    for &b in &bytes[1..] {
+        if !(b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+            return false;
+        }
+    }
+    true
+}
+
+impl WikiLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parses a log file content. Lines that don't match the format are skipped silently.
+    /// Header `# Wiki operation log` and frontmatter are skipped.
+    #[allow(clippy::expect_used)] // mandatory regex groups, see `log_re`
+    pub fn parse(content: &str) -> Result<Self> {
+        let re = log_re();
+        let mut entries = Vec::new();
+        for raw_line in content.lines() {
+            let line = raw_line.trim_end();
+            if let Some(cap) = re.captures(line) {
+                let ts_str = cap.get(1).expect("group 1").as_str();
+                let op = cap.get(2).expect("group 2").as_str().to_string();
+                let summary = cap.get(3).expect("group 3").as_str().to_string();
+                let timestamp = match DateTime::parse_from_rfc3339(ts_str) {
+                    Ok(dt) => dt.with_timezone(&Utc),
+                    Err(_) => continue,
+                };
+                entries.push(LogEntry {
+                    timestamp,
+                    op,
+                    summary,
+                });
+            }
+        }
+        Ok(Self { entries })
+    }
+
+    /// Loads a log from disk. If the file doesn't exist, returns an empty `WikiLog`.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        match fs::read_to_string(path) {
+            Ok(content) => Self::parse(&content),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::new()),
+            Err(source) => Err(CoralError::Io {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Appends a new entry with `timestamp = Utc::now()`. Returns the appended entry.
+    pub fn append(&mut self, op: impl Into<String>, summary: impl Into<String>) -> &LogEntry {
+        let entry = LogEntry {
+            timestamp: Utc::now(),
+            op: op.into(),
+            summary: summary.into(),
+        };
+        self.entries.push(entry);
+        // `last()` is statically `Some` immediately after `push`; the
+        // expect message is the contract for any future refactor that
+        // moves the `push` away from this return.
+        #[allow(clippy::expect_used)]
+        self.entries.last().expect("just pushed")
+    }
+
+    /// Serializes to a Markdown document.
+    #[allow(clippy::inherent_to_string)]
+    pub fn to_string(&self) -> String {
+        let mut out = String::new();
+        out.push_str("---\n");
+        out.push_str("type: log\n");
+        out.push_str("---\n\n");
+        out.push_str("# Wiki operation log\n\n");
+        for entry in &self.entries {
+            out.push_str(&format!(
+                "- {} {}: {}\n",
+                entry.timestamp.to_rfc3339(),
+                entry.op,
+                entry.summary
+            ));
+        }
+        out
+    }
+
+    /// Persists the entire log to disk (overwrite). Atomic via
+    /// temp-file + rename, so concurrent readers never see a torn file.
+    /// Creates parent dirs.
+    ///
+    /// For SINGLE-ENTRY appends prefer `WikiLog::append_atomic` — it
+    /// uses `O_APPEND` and avoids the load+modify+save lost-update race
+    /// entirely.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        crate::atomic::atomic_write_string(path, &self.to_string())
+    }
+
+    /// **Atomic single-entry append.** Opens the log file in append mode
+    /// and writes a single formatted entry line. Race-free under
+    /// concurrent writers — the entire create-or-append sequence runs
+    /// inside an `flock(2)` advisory lock so the first-create header
+    /// write and any racing append-only writers are serialized.
+    ///
+    /// This is the recommended path for callers that only need to add
+    /// ONE entry and don't care about the full history (e.g. `coral
+    /// ingest`, `coral consolidate`, `coral lint --auto-fix`). It avoids
+    /// the load+modify+save race that the `WikiLog::load` →
+    /// `WikiLog::append` → `WikiLog::save` pattern has under concurrent
+    /// writers (documented in `crates/coral-core/tests/concurrency.rs`).
+    ///
+    /// v0.19.6 audit C2: previously the create vs. append branches each
+    /// raced on their own. Two threads could both win the
+    /// `create_new(true)` AlreadyExists / Ok branches respectively;
+    /// `O_APPEND` made each `write()` atomic-seek-to-EOF, but the loser
+    /// could land its single-line entry BETWEEN the winner's header
+    /// `write_all` and the winner's entry `write_all`, producing
+    /// on-disk garbage like:
+    ///   - <loser-entry>
+    ///   ---
+    ///   type: log
+    ///   ---
+    ///   # Wiki operation log
+    ///   - <winner-entry>
+    /// Wrapping the whole sequence in `with_exclusive_lock` makes the
+    /// header-then-entry pair indivisible.
+    ///
+    /// On the first write, seeds the YAML frontmatter + heading block.
+    ///
+    /// Creates parent dirs.
+    ///
+    /// # Op-name shape constraint (v0.19.8 #33)
+    ///
+    /// `op` must match the regex `\w[\w-]*` — i.e. a single token of
+    /// ASCII alphanumerics + `_`/`-`, with no whitespace, no leading
+    /// digit-only restriction, and no other punctuation. The on-disk
+    /// log v1 format depends on this: `WikiLog::parse` uses the same
+    /// regex shape and **silently skips** entries whose op doesn't
+    /// match (whitespace inside the op breaks the parser's
+    /// space-separated tokenization). Callers passing an op with
+    /// whitespace would write a line that subsequent `coral history`
+    /// reads disappear from history.
+    ///
+    /// Debug builds enforce this with a `debug_assert!` that panics
+    /// the offending caller. Release builds rely on the existing
+    /// single-token convention every in-tree caller already follows
+    /// (`init`, `bootstrap`, `ingest`, `lint`, `consolidate`,
+    /// `onboard`, `merge`, `split`, `retire`, …).
+    ///
+    /// A v1.0+ format-stability decision could relax this (quoted ops
+    /// for whitespace) but it would silently change the on-disk
+    /// format for upgraders. Tracked as deferred.
+    pub fn append_atomic(
+        path: impl AsRef<Path>,
+        op: impl Into<String>,
+        summary: impl Into<String>,
+    ) -> Result<LogEntry> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|source| CoralError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+
+        let entry = LogEntry {
+            timestamp: Utc::now(),
+            op: op.into(),
+            summary: summary.into(),
+        };
+        // v0.19.8 #33: catch new bad callers in dev builds. Release
+        // builds skip the check (zero overhead) and rely on the
+        // single-token convention every in-tree caller already follows.
+        // The constraint matches `WikiLog::parse`'s regex (`\w[\w-]*`)
+        // exactly; a mismatch on the write path silently produces
+        // entries that get dropped on the read path.
+        debug_assert!(
+            is_valid_op_name(&entry.op),
+            "WikiLog::append_atomic: op {:?} does not match `\\w[\\w-]*` — \
+             entry would be silently dropped by `WikiLog::parse` (#33). \
+             Use a single-token op like `init`, `bootstrap`, etc.",
+            entry.op
+        );
+        let line = format!(
+            "- {} {}: {}\n",
+            entry.timestamp.to_rfc3339(),
+            entry.op,
+            entry.summary
+        );
+
+        // v0.19.6 audit C2: serialize the entire create-or-append
+        // sequence so the header can never be split across racing
+        // writers' bytes. `with_exclusive_lock` also guards us against
+        // peer processes (cross-process safety: same primitive used by
+        // `index.md` and `coral.lock`).
+        crate::atomic::with_exclusive_lock(path, || {
+            match fs::OpenOptions::new()
+                .append(true)
+                .create_new(true)
+                .open(path)
+            {
+                Ok(mut f) => {
+                    let header = "---\ntype: log\n---\n\n# Wiki operation log\n\n";
+                    f.write_all(header.as_bytes())
+                        .and_then(|_| f.write_all(line.as_bytes()))
+                        .map_err(|source| CoralError::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        })?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let mut f =
+                        fs::OpenOptions::new()
+                            .append(true)
+                            .open(path)
+                            .map_err(|source| CoralError::Io {
+                                path: path.to_path_buf(),
+                                source,
+                            })?;
+                    f.write_all(line.as_bytes())
+                        .map_err(|source| CoralError::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        })?;
+                }
+                Err(source) => {
+                    return Err(CoralError::Io {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+            }
+            Ok(())
+        })?;
+
+        Ok(entry)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn log_new_is_empty() {
+        let log = WikiLog::new();
+        assert!(log.entries.is_empty());
+    }
+
+    #[test]
+    fn log_append_increments_entries() {
+        let mut log = WikiLog::new();
+        log.append("bootstrap", "12 pages created");
+        log.append("ingest", "3 pages updated");
+        log.append("lint", "no warnings");
+        assert_eq!(log.entries.len(), 3);
+        let last = log.entries.last().unwrap();
+        assert_eq!(last.op, "lint");
+        assert_eq!(last.summary, "no warnings");
+    }
+
+    #[test]
+    fn log_serialize_roundtrip() {
+        let mut log = WikiLog::new();
+        log.append("bootstrap", "12 pages created");
+        log.append("ingest", "3 pages updated");
+
+        let serialized = log.to_string();
+        let reparsed = WikiLog::parse(&serialized).expect("parse");
+        assert_eq!(reparsed.entries.len(), log.entries.len());
+        for (a, b) in log.entries.iter().zip(reparsed.entries.iter()) {
+            assert_eq!(a.op, b.op);
+            assert_eq!(a.summary, b.summary);
+            // Timestamps compared as rfc3339 strings — the serialize path truncates / re-encodes.
+            assert_eq!(a.timestamp.to_rfc3339(), b.timestamp.to_rfc3339());
+        }
+    }
+
+    #[test]
+    fn log_parse_skips_malformed_lines() {
+        let content = "\
+---
+type: log
+---
+
+# Wiki operation log
+
+- 2026-04-30T18:00:00Z bootstrap: 12 pages created
+- not a timestamp at all
+random nonsense
+";
+        let log = WikiLog::parse(content).expect("parse");
+        assert_eq!(log.entries.len(), 1);
+        assert_eq!(log.entries[0].op, "bootstrap");
+        assert_eq!(log.entries[0].summary, "12 pages created");
+    }
+
+    #[test]
+    fn log_load_returns_empty_when_file_missing() {
+        let bogus = std::path::PathBuf::from("/definitely/does/not/exist/log-xyz-9999.md");
+        let log = WikiLog::load(&bogus).expect("missing file should be Ok empty");
+        assert!(log.entries.is_empty());
+    }
+
+    #[test]
+    fn log_save_creates_parent_dirs() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("a/b/log.md");
+        let mut log = WikiLog::new();
+        log.append("bootstrap", "12 pages created");
+        log.save(&target).expect("save");
+        assert!(target.exists());
+        let reloaded = WikiLog::load(&target).expect("reload");
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].op, "bootstrap");
+    }
+
+    #[test]
+    fn append_atomic_seeds_header_and_writes_entry_when_file_missing() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("log.md");
+        let entry =
+            WikiLog::append_atomic(&target, "bootstrap", "12 pages").expect("first append_atomic");
+        assert_eq!(entry.op, "bootstrap");
+        assert_eq!(entry.summary, "12 pages");
+        let reloaded = WikiLog::load(&target).expect("reload");
+        assert_eq!(reloaded.entries.len(), 1);
+        assert_eq!(reloaded.entries[0].op, "bootstrap");
+        // Header must be present (otherwise WikiLog::parse silently
+        // skips lines, and our test would still pass; but check the raw
+        // content to pin the format).
+        let raw = std::fs::read_to_string(&target).expect("read raw");
+        assert!(raw.starts_with("---\ntype: log\n---\n\n# Wiki operation log\n\n"));
+    }
+
+    #[test]
+    fn append_atomic_appends_to_existing_log_without_dropping_history() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("log.md");
+        let mut log = WikiLog::new();
+        log.append("seed-1", "first");
+        log.append("seed-2", "second");
+        log.save(&target).expect("save seed");
+
+        WikiLog::append_atomic(&target, "ingest", "third").expect("append_atomic");
+
+        let reloaded = WikiLog::load(&target).expect("reload");
+        assert_eq!(reloaded.entries.len(), 3);
+        assert_eq!(reloaded.entries[0].op, "seed-1");
+        assert_eq!(reloaded.entries[1].op, "seed-2");
+        assert_eq!(reloaded.entries[2].op, "ingest");
+        assert_eq!(reloaded.entries[2].summary, "third");
+    }
+
+    #[test]
+    fn append_atomic_creates_parent_dirs() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("nested/dirs/log.md");
+        WikiLog::append_atomic(&target, "init", "wiki initialized").expect("append_atomic");
+        assert!(target.exists());
+        let reloaded = WikiLog::load(&target).expect("reload");
+        assert_eq!(reloaded.entries.len(), 1);
+    }
+
+    #[test]
+    fn append_atomic_concurrent_preserves_all_entries() {
+        // Race-free under N concurrent writers — POSIX O_APPEND guarantees
+        // single writes ≤ PIPE_BUF are atomic. This is the test that
+        // documents the v0.14 fix to the load+modify+save race tracked in
+        // crates/coral-core/tests/concurrency.rs::wikilog_append_concurrent.
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("log.md");
+        const N: usize = 20;
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let target = target.clone();
+                s.spawn(move || {
+                    WikiLog::append_atomic(&target, "test", format!("entry-{i}"))
+                        .expect("append_atomic");
+                });
+            }
+        });
+        let final_log = WikiLog::load(&target).expect("reload");
+        assert_eq!(
+            final_log.entries.len(),
+            N,
+            "atomic-append must preserve all {N} entries under concurrent writers; \
+             observed {}",
+            final_log.entries.len()
+        );
+        // Verify every per-thread marker landed.
+        let summaries: std::collections::BTreeSet<&str> = final_log
+            .entries
+            .iter()
+            .map(|e| e.summary.as_str())
+            .collect();
+        for i in 0..N {
+            let expected = format!("entry-{i}");
+            assert!(
+                summaries.contains(expected.as_str()),
+                "missing entry: {expected}"
+            );
+        }
+    }
+
+    /// v0.19.6 audit C2 regression: under concurrent first-create
+    /// writers the on-disk file must NEVER show a log entry BEFORE the
+    /// frontmatter header. Pre-fix the loser of the `create_new` race
+    /// could land its `- <entry>` line between the winner's `header`
+    /// and `entry` writes, producing:
+    ///   `- <loser>\n---\ntype: log\n---\n# Wiki operation log\n- <winner>\n`
+    /// Post-fix the entire sequence runs under `with_exclusive_lock`, so
+    /// the file always starts with the canonical header block.
+    #[test]
+    fn append_atomic_first_create_race_never_produces_entry_before_header() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("log.md");
+        const N: usize = 8;
+        std::thread::scope(|s| {
+            for i in 0..N {
+                let target = target.clone();
+                s.spawn(move || {
+                    WikiLog::append_atomic(&target, "race", format!("entry-{i}"))
+                        .expect("append_atomic");
+                });
+            }
+        });
+        let raw = std::fs::read_to_string(&target).expect("read raw log");
+        // Header must appear at the VERY START — never preceded by an
+        // entry line.
+        assert!(
+            raw.starts_with("---\ntype: log\n---\n\n# Wiki operation log\n"),
+            "header was split / preceded by an entry; raw bytes:\n{raw}"
+        );
+        // All N entries present.
+        let final_log = WikiLog::parse(&raw).expect("parse");
+        assert_eq!(
+            final_log.entries.len(),
+            N,
+            "expected {N} entries, got {}; raw:\n{raw}",
+            final_log.entries.len()
+        );
+        // Cross-check: no entry line appears before the header marker.
+        let header_pos = raw
+            .find("# Wiki operation log")
+            .expect("header marker missing");
+        let prelude = &raw[..header_pos];
+        for line in prelude.lines() {
+            assert!(
+                !line.starts_with("- "),
+                "found entry line before header in prelude: {line:?}"
+            );
+        }
+    }
+
+    /// v0.19.8 #33: well-shaped op names pass without debug-asserting.
+    #[test]
+    fn append_atomic_accepts_well_shaped_op_names() {
+        let dir = TempDir::new().expect("tempdir");
+        for ok in [
+            "init",
+            "bootstrap",
+            "lint-fix",
+            "consolidate_pass",
+            "ok-op",
+            "OnboardV2",
+            "_internal",
+        ] {
+            let target = dir.path().join(format!("log-{ok}.md"));
+            WikiLog::append_atomic(&target, ok, "summary").expect("well-shaped op must succeed");
+        }
+    }
+
+    /// v0.19.8 #33: in dev builds, an op containing whitespace must
+    /// `debug_assert!`-panic so the bad caller is caught early. The
+    /// regex-shape constraint is enforced at PARSE time today
+    /// (silent skip); this assertion brings WRITE-time enforcement
+    /// to dev builds.
+    ///
+    /// Gated on `debug_assertions` because release builds disable the
+    /// assert (zero overhead) — the in-tree convention covers it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "does not match")]
+    fn append_atomic_rejects_op_with_whitespace_in_dev_builds() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("log.md");
+        let _ = WikiLog::append_atomic(&target, "bad op", "summary");
+    }
+
+    /// Sibling: leading hyphen is also rejected (regex `\w` excludes `-`
+    /// at start position).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "does not match")]
+    fn append_atomic_rejects_op_with_leading_hyphen_in_dev_builds() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("log.md");
+        let _ = WikiLog::append_atomic(&target, "-leading", "summary");
+    }
+
+    /// Sibling: empty op also rejected.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "does not match")]
+    fn append_atomic_rejects_empty_op_in_dev_builds() {
+        let dir = TempDir::new().expect("tempdir");
+        let target = dir.path().join("log.md");
+        let _ = WikiLog::append_atomic(&target, "", "summary");
+    }
+
+    /// `is_valid_op_name` direct unit checks. Pinning the helper because
+    /// `WikiLog::append_atomic` and `WikiLog::parse` need to agree.
+    #[test]
+    fn is_valid_op_name_matches_log_regex_shape() {
+        for ok in [
+            "init",
+            "x",
+            "x-y",
+            "x_y",
+            "v2",
+            "OnboardV2",
+            "_internal",
+            "ok-op",
+        ] {
+            assert!(is_valid_op_name(ok), "should accept {ok:?}");
+        }
+        for bad in [
+            "",
+            "-leading",
+            "with space",
+            "with\ttab",
+            "with.dot",
+            "with/slash",
+            "with:colon",
+            "with\nnewline",
+            "with\"quote",
+            "café",
+        ] {
+            assert!(!is_valid_op_name(bad), "should reject {bad:?}");
+        }
+    }
+}

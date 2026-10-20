@@ -1,0 +1,41 @@
+[package]
+name = "coral-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Coral runner: Claude CLI wrapper + mock for tests."
+
+[features]
+default = []
+local-embeddings = ["dep:ort", "dep:tokenizers"]
+
+[dependencies]
+# v0.41 P1: observability module (progress! macro) lives in coral-core.
+coral-core = { path = "../coral-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# v0.21.4: `multi_step.rs` parses the planner tier's YAML plan output.
+# `serde_yaml_ng` is already a workspace dep used by every other YAML
+# parser in Coral; reusing it keeps the v0.21.4 introduction "zero new
+# dependencies" in the workspace sense.
+serde_yaml_ng = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+rayon = { workspace = true }
+# Local ONNX embeddings — heavy deps behind a feature flag.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["std", "download-binaries", "tls-native"] }
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["macros", "rt"] }
+tempfile = { workspace = true }
+
+# v0.35 Phase C — inherit workspace clippy lints (unwrap/expect/panic
+# = warn). Surfaces panic-risk sites without breaking CI.
+[lints]
+workspace = true

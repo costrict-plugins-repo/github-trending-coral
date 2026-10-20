@@ -1,0 +1,215 @@
+[workspace]
+members = ["crates/*"]
+resolver = "2"
+
+[workspace.package]
+version = "0.41.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT"
+authors = ["Agustín Bajo <agustinbajo@gmail.com>"]
+repository = "https://github.com/agustincbajo/Coral"
+description = "Karpathy-style LLM Wiki maintainer for Git repos"
+
+[workspace.dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+# v0.34.0 onboarding (FR-ONB-26): `preserve_order` keeps the user's key
+# ordering when we patch `.claude/settings.json` via `coral self
+# register-marketplace`. Without it, serde_json reorders keys
+# alphabetically on round-trip, which would surprise users dotfiles-
+# managing their Claude config. The feature pulls in `indexmap` as the
+# Map backing (~30 KB, already in the tree via other deps); no new
+# transitives. Pin lives here so every crate consuming `serde_json`
+# from the workspace agrees on the feature set.
+serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml_ng = "0.10"
+regex = "1"
+walkdir = "2"
+rayon = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
+ahash = "0.8"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+include_dir = "0.7"
+toml = "0.8"
+tempfile = "3"
+assert_fs = "1"
+fs4 = "0.13"
+predicates = "3"
+assert_cmd = "2"
+schemars = { version = "0.8", features = ["chrono"] }
+# v0.21.1: HTTP/SSE MCP transport (Streamable HTTP per MCP 2025-11-25).
+# Picked tiny-http over hyper/axum because the MCP HTTP transport is a
+# small, blocking-I/O surface — POST /mcp + GET /mcp + DELETE /mcp —
+# and tiny-http is single-purpose, dep-light, and has no async runtime
+# dragging the rest of the workspace into tokio. This is the only new
+# dep in v0.21.1 (justified in the orchestrator's spec §4).
+tiny_http = "0.12"
+# v0.22.6: `coral skill build` produces an Anthropic-Skills-compatible
+# zip bundle from `template/`. We need a deterministic deflate-zip
+# writer; the std library doesn't ship one and writing a minimal
+# zip header by hand (LFH + central directory + EOCD) is
+# error-prone. `zip` 2.x (~50 KB) is single-purpose and pure-rust
+# with `default-features = false, features = ["deflate"]` (drops
+# bzip2/xz/zstd system-lib transitives — we don't use those
+# methods). Justified per orchestrator's spec §D3.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# v0.23.1: `coral monitor up` is a long-lived foreground loop that
+# must exit cleanly on SIGINT/SIGTERM with a final summary printed
+# and the JSONL file's last line synced to disk. Hand-rolling
+# `unsafe { libc::signal(...) }` works but signal-hook-registry's
+# AtomicBool sentinel pattern is the well-trodden, easier-to-reason-
+# about path. ~30 KB single-purpose dep with `libc` as the only
+# transitive — both already in the tree via tracing/clap.
+signal-hook = "0.3"
+# v0.23.3: `coral test --kind property-based` runs Schemathesis-style
+# property tests over OpenAPI specs. proptest gives us hand-rolled
+# `BoxedStrategy<Value = serde_json::Value>` for the 5 JSON-Schema
+# types we generate (string/number/integer/object/array), plus
+# automatic shrinking on failure. **Already in the dev-dep tree of
+# `coral-core` and `coral-lint`** — promoting to a workspace dep just
+# centralizes the version pin. No new transitives — everything in
+# proptest 1.x's tree (`bit-set`, `bit-vec`, `bitflags`, `num-traits`,
+# `quick-error`, `rand`, `rand_chacha`, `regex`, `regex-syntax`,
+# `unarray`) was already pulled in by criterion / regex / rand /
+# proptest itself when the dev-deps compiled. Justified per
+# orchestrator's spec working-agreement #2.
+proptest = "1"
+# v0.24.0: global allocator for the CLI binary. mimalloc replaces the
+# system allocator for 10-20% throughput on allocation-heavy workloads
+# (TF-IDF scoring, wiki parsing, large OpenAPI property-test generation).
+# Single-purpose, ~40 KB, pure-C with a thin Rust wrapper; no new Rust
+# transitives beyond the `libmimalloc-sys` build-script.
+mimalloc = { version = "0.1", default-features = false }
+# v0.25.0 M3.1: persisted BM25 search index. Sub-millisecond load vs
+# multi-ms rebuild on 5000+ page wikis.
+#
+# v0.39.0 migration: bincode 2.x → postcard 1.x (BACKLOG #7 closure).
+# bincode upstream stopped maintenance on 2025-12-16 (RUSTSEC-2025-0141
+# covers ALL bincode versions, 1.x and 2.x alike — the v0.34.x 1.x→2.x
+# bump didn't clear the advisory). postcard is the documented next-hop
+# the audit recommended: actively maintained, no_std-friendly, varint
+# wire format (similar size to bincode 2.x), serde-integrated so the
+# `SearchIndex` struct keeps its single set of `Serialize`/`Deserialize`
+# derives.
+#
+# On-disk format change: postcard's wire format is NOT compatible with
+# bincode 2.x. The `load_index` codepath in `coral-core::search_index`
+# catches the decode error, logs the format mismatch via
+# `tracing::warn!`, and lets `search_with_index` rebuild the cache
+# transparently on the next call — same fallback path that already
+# absorbed the v0.34.x 1.x→2.x flip. Old `.coral/search-index.bin`
+# files are silently invalidated; no user action required.
+#
+# Single-purpose, pure-Rust, ~30 KB. `default-features = false` drops
+# the `heapless-cas` default which transitively pulls
+# `atomic-polyfill` (RUSTSEC-2023-0089, unmaintained — see
+# https://github.com/embassy-rs/atomic-polyfill). The `alloc` feature
+# is the only one we need: it enables `to_allocvec` / heap-Vec
+# encoding (we encode in-memory then hand the buffer to
+# `atomic_write_bytes`). Decoding via `from_bytes` / `take_from_bytes`
+# works in the no_std default config too.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+# v0.32.0 webui: MIME-type detection for `coral-ui`'s embedded static
+# assets (CSS/JS/HTML/png/svg) served by the new `coral ui serve`
+# subcommand. Single-purpose, pure-Rust, ~30 KB; no new transitives
+# beyond `unicase` (already in the tree via `idna`).
+mime_guess = "2"
+# v0.34.0 onboarding (FR-ONB-32): SHA-256 verification of the binary
+# downloaded by `coral self-upgrade`. We already pull `sha2` into
+# `coral-core` for the BM25 cache key; promoting to a workspace dep
+# centralizes the version pin so `coral-cli` and `coral-core` can't
+# drift apart. Single-purpose, pure-Rust, ~30 KB; transitive
+# `cpufeatures` + `digest` were already in the tree via the existing
+# coral-core dep — no net-new transitives.
+sha2 = "0.10"
+# v0.34.0 onboarding (FR-ONB-32 Windows path): direct bindings to
+# `MoveFileExW` (and friends) so `coral self-upgrade` can do the
+# rename-then-replace dance Windows requires for an in-use `.exe`
+# (Unix can rename atomically while the binary is mapped; Windows
+# returns `ERROR_SHARING_VIOLATION`). Pinned to the same feature
+# subset MoveFileEx needs — nothing wider. ~5 MB unpacked but only
+# the requested module trees compile in, and the `windows-targets`
+# transitive is already pulled in by `tempfile`'s Windows backend.
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
+# v0.34.0 onboarding (FR-ONB-27): tiny synchronous HTTP client for the
+# 1-token provider ping in the `coral-doctor` mini-wizard (verifies
+# the API key the user just pasted works before we persist it). We
+# need exactly one POST per provider — not worth dragging `reqwest` +
+# tokio into the tree. `ureq` is sync, ~150 KB, with `rustls`/`native-
+# tls` opt-in; we take the default rustls path. Pure-Rust TLS chain
+# avoids OpenSSL system-lib coupling on Linux distros.
+ureq = { version = "2", features = ["json"] }
+# v0.34.0 onboarding (FR-ONB-27): interactive prompts for the provider
+# mini-wizard (`Select`, `Password`, `Confirm`). `dialoguer` is the
+# de facto Rust prompt crate (~80 KB) — terminal-only, no TUI
+# framework dragged in. Used exclusively by `coral self-uninstall`
+# (`Confirm`) and `coral-doctor` (`Select` + `Password`); falls back
+# gracefully when stdin is not a TTY (we refuse to prompt and require
+# an explicit `--yes` flag instead).
+dialoguer = "0.11"
+# v0.35 SEC-07: CSPRNG-backed `Mcp-Session-Id` minting (replaces a
+# `timestamp_nanos * 0xdeadbeef + counter` mixer that was predictable
+# from the server's wall-clock). `rand` 0.9.x was already in the
+# dev-dep tree via `proptest`; promoting to a workspace dep centralizes
+# the version pin and lets non-test code (the MCP HTTP transport) call
+# `rand::random::<[u8; 16]>()` without re-introducing the
+# `getrandom` cfg dance ourselves. Pure-Rust, no net-new system deps.
+rand = "0.9"
+# v0.35 Q-C1: `parking_lot::Mutex` replaces every `std::sync::Mutex`
+# in `coral-mcp::server` + `transport::http_sse`. The std mutex
+# poisons on panic — combined with the pre-auth attack surface in the
+# HTTP transport (SEC-01), a single panicking handler thread would
+# kill every subsequent request. parking_lot has no poison semantics,
+# is ~2x faster on uncontended acquires, and lets us drop the
+# `.expect("…mutex")` boilerplate that masks the actual lock owner in
+# panic backtraces. Tiny dep (~50 KB), pure-Rust, single transitive
+# (`lock_api`) already pulled in by other deps.
+parking_lot = "0.12"
+coral-core = { path = "crates/coral-core", version = "0.41.0" }
+coral-env = { path = "crates/coral-env", version = "0.41.0" }
+coral-graph = { path = "crates/coral-graph", version = "0.41.0" }
+coral-implement = { path = "crates/coral-implement", version = "0.41.0" }
+coral-index = { path = "crates/coral-index", version = "0.41.0" }
+coral-lint = { path = "crates/coral-lint", version = "0.41.0" }
+coral-runner = { path = "crates/coral-runner", version = "0.41.0" }
+coral-search = { path = "crates/coral-search", version = "0.41.0" }
+coral-session = { path = "crates/coral-session", version = "0.41.0" }
+coral-stats = { path = "crates/coral-stats", version = "0.41.0" }
+coral-test = { path = "crates/coral-test", version = "0.41.0" }
+coral-mcp = { path = "crates/coral-mcp", version = "0.41.0" }
+coral-ui = { path = "crates/coral-ui", version = "0.41.0" }
+
+# v0.35 Phase C — workspace-wide clippy lints. Surfaces the ~70 unwrap /
+# 51 expect call sites the Q audit flagged as latent panic risk, without
+# breaking CI. Each crate opts in via `[lints] workspace = true`.
+#
+# The level is `warn`, not `deny`: the goal is a ratcheted reduction
+# tracked in BACKLOG.md, not a hard wall in front of new feature work.
+# Promote to `deny` once the count is < 10 and the surviving sites have
+# a `#[allow(clippy::xxx, reason = "…")]` annotation explaining why
+# they're justified.
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
+
+# Compact DWARF: panic backtraces + test failure locations stay readable,
+# per-variable tables drop. Cuts debug binaries by ~60%. Override with
+# `RUSTFLAGS="-C debuginfo=2"` if you need lldb/gdb variable inspection.
+# Full rationale + numbers: docs/DEVELOPMENT.md.
+[profile.dev]
+debug = "line-tables-only"

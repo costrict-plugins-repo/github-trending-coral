@@ -1,0 +1,755 @@
+use anyhow::{Context, Result};
+use chrono::Utc;
+use clap::Args;
+use coral_core::WikiIndex;
+use coral_core::gitdiff;
+use coral_core::log::WikiLog;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+#[derive(Args, Debug)]
+pub struct InitArgs {
+    /// Force overwrite of an existing .wiki/ (DESTRUCTIVE — re-creates index/log).
+    #[arg(long)]
+    pub force: bool,
+    /// Auto-accept the CLAUDE.md append even when the existing file is
+    /// already long (> 150 lines). Without this, `coral init` defaults
+    /// to skipping the append and tells the user to use the
+    /// `/coral:coral-doctor` slash command as a routing fallback.
+    /// See FR-ONB-25 + R12 in PRD v1.4.
+    #[arg(long)]
+    pub yes: bool,
+    /// BACKLOG #12 L2 (v0.40.2): non-interactive provider scaffold.
+    /// Currently supports `claude_cli` — writes `[provider.claude_cli]`
+    /// to `.coral/config.toml`, bypassing the TTY-required
+    /// `coral doctor --wizard`. For providers that need credentials
+    /// (anthropic / gemini / ollama), use the wizard interactively.
+    ///
+    /// When unset, `coral init` auto-detects `claude` on PATH and
+    /// scaffolds `[provider.claude_cli]` ONLY if no `.coral/config.toml`
+    /// exists yet. Existing configs are never modified.
+    #[arg(long, value_name = "KIND")]
+    pub provider: Option<String>,
+}
+
+const SCHEMA_BASE: &str = include_str!("../../../../template/schema/SCHEMA.base.md");
+const CLAUDE_MD_TEMPLATE: &str = include_str!("../../../../template/CLAUDE.md.tmpl");
+
+/// FR-ONB-25: When the existing `CLAUDE.md` is already past this many
+/// lines, appending our ~20-line routing block risks pushing the
+/// document over the 200-line "adherence cliff" Anthropic documents
+/// in `code.claude.com/docs/en/memory`. We warn + default to skip.
+const CLAUDE_MD_SIZE_GUARD_LINES: usize = 150;
+
+pub fn run(args: InitArgs, wiki_root: Option<&Path>) -> Result<ExitCode> {
+    let root: PathBuf = wiki_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(".wiki"));
+    let cwd = std::env::current_dir().context("getting cwd")?;
+
+    // BACKLOG #12 L1 (v0.40.1): re-runs over an existing `.wiki/` used
+    // to early-return here, which silently skipped FR-ONB-34 gitignore
+    // hardening and FR-ONB-25 CLAUDE.md scaffolding. Those steps are
+    // independent of wiki-content state and idempotent (per-file
+    // existence checks + `apply_claude_md` decision tree), so we
+    // remember the state and let the function continue. The per-file
+    // guards below (`if !path.exists() || args.force`) keep the wiki
+    // content untouched on re-runs without `--force`.
+    let wiki_already_initialized = root.exists() && !args.force && root.join("SCHEMA.md").exists();
+    if wiki_already_initialized {
+        tracing::info!(
+            "`.wiki/` already initialized; ensuring gitignore + CLAUDE.md \
+             scaffolds (idempotent). Pass --force to also re-create wiki content."
+        );
+    }
+
+    std::fs::create_dir_all(&root).with_context(|| format!("creating {}", root.display()))?;
+
+    // SCHEMA.md — embedded base.
+    let schema_path = root.join("SCHEMA.md");
+    if !schema_path.exists() || args.force {
+        std::fs::write(&schema_path, SCHEMA_BASE)
+            .with_context(|| format!("writing {}", schema_path.display()))?;
+        tracing::info!(path = %schema_path.display(), "wrote SCHEMA.md");
+    }
+
+    // index.md — bootstrap with current HEAD.
+    //
+    // Week 3 validator B2: previous releases silently fell back to a
+    // zero SHA when `git rev-parse HEAD` failed (no `.git/` directory,
+    // or an empty repo before the first commit). That fallback shipped
+    // a fake `last_updated_commit` into the index and every page that
+    // bootstrapped off it, which then desynced from the real history
+    // the moment the user added a real commit. The behavior was
+    // surprising and never documented. We now fail loudly with an
+    // actionable next step — `coral init` makes no sense outside a
+    // git repo, so the only "right" recovery is `git init` first.
+    let index_path = root.join("index.md");
+    if !index_path.exists() || args.force {
+        let head = gitdiff::head_sha(&cwd).map_err(|e| {
+            anyhow::anyhow!(
+                "coral init requires a git repository.\n  Run `git init` first, then `coral init` again.\n  (underlying error: {e})"
+            )
+        })?;
+        let mut idx = WikiIndex::new(head);
+        idx.generated_at = Utc::now();
+        coral_core::atomic::atomic_write_string(&index_path, &idx.to_string()?)
+            .with_context(|| format!("writing {}", index_path.display()))?;
+        tracing::info!(path = %index_path.display(), "wrote index.md");
+    }
+
+    // log.md — append-only operation log seeded with the init event.
+    // `--force` truncates first so the seed entry is the only line.
+    let log_path = root.join("log.md");
+    if !log_path.exists() || args.force {
+        if args.force && log_path.exists() {
+            std::fs::remove_file(&log_path)
+                .with_context(|| format!("removing {} for --force re-init", log_path.display()))?;
+        }
+        WikiLog::append_atomic(&log_path, "init", "wiki initialized")
+            .with_context(|| format!("writing {}", log_path.display()))?;
+        tracing::info!(path = %log_path.display(), "wrote log.md");
+    }
+
+    // .gitignore — keep generated artifacts out of git. Idempotent: when
+    // the file is missing we write all entries; when the user already
+    // manages a .gitignore, we append any missing entries without
+    // touching unrelated lines.
+    //
+    // v0.19.8 #32 (tracked deferral): `with_exclusive_lock` leaves
+    // zero-byte sentinel files at `<path>.lock` after release. The
+    // safe cleanup approach (unlink-after-release) breaks the
+    // cross-process flock contract by detaching the inode while a
+    // peer process holds the FD; documented in `atomic.rs`. Live with
+    // the litter, ignore it in git so users don't accidentally commit
+    // it. Patterns: `*.lock` covers single-suffix sentinels (e.g.
+    // `coral.toml.lock`); `*.lock.lock` is also added explicitly so
+    // a future user-managed `.gitignore` that drops `*.lock` still
+    // hides the doubled form from `git status`.
+    let gitignore_path = root.join(".gitignore");
+    let needed = [
+        ".coral-cache.json",
+        ".coral-embeddings.json",
+        "*.lock",
+        "*.lock.lock",
+    ];
+    if !gitignore_path.exists() {
+        let mut content = String::new();
+        for entry in &needed {
+            content.push_str(entry);
+            content.push('\n');
+        }
+        std::fs::write(&gitignore_path, content)
+            .with_context(|| format!("writing {}", gitignore_path.display()))?;
+        tracing::info!(path = %gitignore_path.display(), "wrote .gitignore");
+    } else {
+        let mut existing = std::fs::read_to_string(&gitignore_path)
+            .with_context(|| format!("reading {}", gitignore_path.display()))?;
+        let mut changed = false;
+        for entry in needed {
+            let already_listed = existing.lines().any(|line| line.trim() == entry);
+            if !already_listed {
+                if !existing.is_empty() && !existing.ends_with('\n') {
+                    existing.push('\n');
+                }
+                existing.push_str(entry);
+                existing.push('\n');
+                changed = true;
+            }
+        }
+        if changed {
+            std::fs::write(&gitignore_path, existing)
+                .with_context(|| format!("updating {}", gitignore_path.display()))?;
+            tracing::info!(path = %gitignore_path.display(), "appended to .gitignore");
+        }
+    }
+
+    // Subdirectories so the structure exists from day 1.
+    for sub in &[
+        "modules",
+        "concepts",
+        "entities",
+        "flows",
+        "decisions",
+        "synthesis",
+        "operations",
+        "sources",
+        "gaps",
+    ] {
+        std::fs::create_dir_all(root.join(sub))?;
+    }
+
+    // v0.20.0 — session captures land at `<project_root>/.coral/sessions/`,
+    // OUTSIDE `.wiki/`. The wiki-level `.gitignore` we just wrote can't cover
+    // them. Touch the project-root `.gitignore` (idempotent: only append
+    // patterns that aren't already listed). This is the v0.20 PRD design Q1
+    // answer: "gitignored by default; curated distillations under
+    // `.coral/sessions/distilled/` live with the rest of the wiki and are
+    // explicitly NOT gitignored."
+    //
+    // Patterns:
+    //   .coral/sessions/*.jsonl        — raw transcripts (PII-rich, never commit)
+    //   .coral/sessions/*.lock         — flock sentinels left by capture
+    //   .coral/sessions/index.json     — local-only session metadata
+    //   !.coral/sessions/distilled/    — curated distillations DO ship in git
+    //
+    // v0.34.0 FR-ONB-34 (security-critical): also block `.coral/`
+    // catch-all + the bootstrap state file. Without these, a user
+    // running `git add .` after `coral init` would commit their
+    // Anthropic API key (in `.coral/config.toml`) and the bootstrap
+    // checkpoint (which may include LLM-token usage metadata). The
+    // catch-all comes AFTER the per-pattern allowlist so the
+    // negation `!.coral/sessions/distilled/` still wins.
+    let project_gitignore = cwd.join(".gitignore");
+    let session_patterns = [
+        ".coral/sessions/*.jsonl",
+        ".coral/sessions/*.lock",
+        ".coral/sessions/index.json",
+        "!.coral/sessions/distilled/",
+        // FR-ONB-34: security-critical entries
+        ".coral/",
+        ".wiki/.bootstrap-state.json",
+        ".wiki/.bootstrap.lock",
+    ];
+    append_gitignore_patterns(&project_gitignore, &session_patterns)
+        .with_context(|| format!("updating {}", project_gitignore.display()))?;
+
+    // FR-ONB-25: generate / append-safe CLAUDE.md with size guard.
+    // The template documents the Coral routing block; we never
+    // overwrite a user's existing content. See `apply_claude_md` for
+    // the full decision tree.
+    let claude_md_path = cwd.join("CLAUDE.md");
+    let outcome = apply_claude_md(&claude_md_path, CLAUDE_MD_TEMPLATE, args.yes)?;
+    match outcome {
+        ClaudeMdOutcome::Created => {
+            tracing::info!(path = %claude_md_path.display(), "wrote CLAUDE.md (new)");
+        }
+        ClaudeMdOutcome::Appended => {
+            tracing::info!(path = %claude_md_path.display(), "appended Coral routing to CLAUDE.md");
+        }
+        ClaudeMdOutcome::AlreadyHasSection => {
+            tracing::info!(
+                path = %claude_md_path.display(),
+                "CLAUDE.md already has `## Coral routing`; nothing to do"
+            );
+        }
+        ClaudeMdOutcome::SkippedTooLong => {
+            eprintln!(
+                "warning: existing CLAUDE.md is long ({}+ lines); skipped Coral routing append. \
+                 Use /coral:coral-doctor as a deterministic routing fallback, or re-run with `--yes` to force.",
+                CLAUDE_MD_SIZE_GUARD_LINES
+            );
+        }
+    }
+
+    if wiki_already_initialized {
+        println!(
+            "✔ `.wiki/` at {} (verified; gitignore + CLAUDE.md scaffolds idempotent)",
+            root.display()
+        );
+    } else {
+        println!("✔ `.wiki/` initialized at {}", root.display());
+    }
+
+    // BACKLOG #12 L2 (v0.40.2): non-interactive provider scaffold.
+    // Three branches:
+    //   1. `--provider <kind>` set → validate + write that section.
+    //   2. Unset + no existing `.coral/config.toml` + `claude` on PATH
+    //      → auto-write `[provider.claude_cli]` so the post-init bootstrap
+    //      flow works out of the box.
+    //   3. Otherwise → no-op (user can run `coral doctor --wizard` or
+    //      hand-edit `.coral/config.toml`).
+    let coral_config_path = coral_core::config::config_path(&cwd);
+    let config_exists = coral_config_path.exists();
+    match args.provider.as_deref() {
+        Some("claude_cli") => {
+            coral_core::config::upsert_provider_section(&cwd, "provider.claude_cli", "")
+                .context("writing [provider.claude_cli] to .coral/config.toml")?;
+            tracing::info!(path = %coral_config_path.display(), "wrote [provider.claude_cli]");
+            println!("✔ Provider claude_cli configured in .coral/config.toml");
+        }
+        Some(other) => {
+            anyhow::bail!(
+                "unsupported --provider value `{other}`. Currently supported: \
+                 claude_cli. For anthropic/gemini/ollama (which need credentials), \
+                 run `coral doctor --wizard` interactively."
+            );
+        }
+        None => {
+            if !config_exists && claude_on_path() {
+                coral_core::config::upsert_provider_section(&cwd, "provider.claude_cli", "")
+                    .context("auto-writing [provider.claude_cli] to .coral/config.toml")?;
+                tracing::info!(
+                    path = %coral_config_path.display(),
+                    "auto-detected `claude` on PATH; wrote [provider.claude_cli]"
+                );
+                println!(
+                    "✔ Auto-detected `claude` CLI on PATH; configured [provider.claude_cli].\n  \
+                     Override with `coral doctor --wizard` to use a different provider."
+                );
+            }
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// True when `claude` (or `claude.exe` on Windows) is present in
+/// `$PATH`. Pure: only reads env + filesystem metadata.
+///
+/// Used by `init::run` to opportunistically scaffold
+/// `[provider.claude_cli]` when no config exists. Intentionally NOT
+/// going through `coral self-check` here — that adds heavier
+/// dependencies and runs a `--version` probe; presence is enough for
+/// init's purpose.
+fn claude_on_path() -> bool {
+    let exe = if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    };
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p.join(exe).is_file()))
+        .unwrap_or(false)
+}
+
+/// Idempotent append of `.gitignore` patterns. If the file doesn't
+/// exist yet, creates it with just the requested entries. If it
+/// does, appends only the entries not already present (line-exact
+/// match, whitespace-trimmed). No-ops when every pattern is already
+/// listed. Public-but-not-doc-published so the test module can
+/// re-use it.
+pub(crate) fn append_gitignore_patterns(path: &Path, patterns: &[&str]) -> std::io::Result<bool> {
+    if !path.exists() {
+        let mut content = String::new();
+        for entry in patterns {
+            content.push_str(entry);
+            content.push('\n');
+        }
+        std::fs::write(path, content)?;
+        return Ok(true);
+    }
+    let mut existing = std::fs::read_to_string(path)?;
+    let mut changed = false;
+    for entry in patterns {
+        let already_listed = existing.lines().any(|line| line.trim() == *entry);
+        if !already_listed {
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                existing.push('\n');
+            }
+            existing.push_str(entry);
+            existing.push('\n');
+            changed = true;
+        }
+    }
+    if changed {
+        std::fs::write(path, existing)?;
+    }
+    Ok(changed)
+}
+
+/// Result of the `CLAUDE.md` handler. Surfaced so tests can assert
+/// the right branch fires without inspecting filesystem state.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ClaudeMdOutcome {
+    /// No existing file — we wrote the full template.
+    Created,
+    /// File existed without the section + size guard passed — we
+    /// appended the template.
+    Appended,
+    /// File existed with `## Coral routing` already — no-op.
+    AlreadyHasSection,
+    /// File existed without the section, but it was already too long
+    /// (> CLAUDE_MD_SIZE_GUARD_LINES) and `--yes` was NOT passed.
+    SkippedTooLong,
+}
+
+/// FR-ONB-25 implementation. See [`ClaudeMdOutcome`] for the branches.
+///
+/// Decision tree:
+/// 1. If file is missing → write the full template (Created).
+/// 2. If file contains `^## Coral routing` (case-insensitive at line
+///    start) → no-op (AlreadyHasSection). We NEVER overwrite the
+///    user's content.
+/// 3. If file lacks the section and is short (<= 150 lines) → append
+///    the template after a blank line (Appended).
+/// 4. If file lacks the section and is long (> 150 lines):
+///    a. If `yes_flag` is set → force-append (Appended).
+///    b. Otherwise → SkippedTooLong (caller prints the warning).
+pub(crate) fn apply_claude_md(
+    path: &Path,
+    template: &str,
+    yes_flag: bool,
+) -> std::io::Result<ClaudeMdOutcome> {
+    if !path.exists() {
+        std::fs::write(path, template)?;
+        return Ok(ClaudeMdOutcome::Created);
+    }
+    let existing = std::fs::read_to_string(path)?;
+    if claude_md_has_routing_section(&existing) {
+        return Ok(ClaudeMdOutcome::AlreadyHasSection);
+    }
+    let line_count = existing.lines().count();
+    if line_count > CLAUDE_MD_SIZE_GUARD_LINES && !yes_flag {
+        return Ok(ClaudeMdOutcome::SkippedTooLong);
+    }
+    // Safe append: ensure trailing newline + a separating blank.
+    let mut next = existing.clone();
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push('\n');
+    next.push_str(template);
+    std::fs::write(path, next)?;
+    Ok(ClaudeMdOutcome::Appended)
+}
+
+/// `^## Coral routing` (case-insensitive). Same logic the
+/// `coral self-check` probe uses — kept in sync so the size-guard
+/// decision matches what the SessionStart hook sees.
+fn claude_md_has_routing_section(raw: &str) -> bool {
+    let needle = "## coral routing";
+    raw.lines()
+        .any(|line| line.to_ascii_lowercase().trim_start().starts_with(needle))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// `append_gitignore_patterns` creates the file when missing.
+    #[test]
+    fn append_gitignore_creates_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        let changed = append_gitignore_patterns(&p, &[".coral/sessions/*.jsonl"]).unwrap();
+        assert!(changed);
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains(".coral/sessions/*.jsonl"));
+    }
+
+    /// Repeated calls are idempotent.
+    #[test]
+    fn append_gitignore_is_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        let _ = append_gitignore_patterns(&p, &[".coral/sessions/*.jsonl"]).unwrap();
+        let changed_again = append_gitignore_patterns(&p, &[".coral/sessions/*.jsonl"]).unwrap();
+        assert!(!changed_again, "second call must be a no-op");
+    }
+
+    /// Existing user .gitignore is preserved; new patterns appended.
+    #[test]
+    fn append_gitignore_preserves_existing_lines() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        std::fs::write(&p, "node_modules/\n*.log\n").unwrap();
+        let _ = append_gitignore_patterns(&p, &[".coral/sessions/*.jsonl"]).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("node_modules/"), "must preserve user lines");
+        assert!(body.contains("*.log"));
+        assert!(body.contains(".coral/sessions/*.jsonl"));
+    }
+
+    /// The session-pattern set includes the `!.coral/sessions/distilled/`
+    /// negation so curated output stays in git.
+    #[test]
+    fn append_gitignore_negation_included_in_session_patterns() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        let session_patterns = [
+            ".coral/sessions/*.jsonl",
+            ".coral/sessions/*.lock",
+            ".coral/sessions/index.json",
+            "!.coral/sessions/distilled/",
+        ];
+        let _ = append_gitignore_patterns(&p, &session_patterns).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains("!.coral/sessions/distilled/"),
+            "negation pattern missing: {body}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // FR-ONB-34: .gitignore security-critical entries
+    // ------------------------------------------------------------------
+
+    /// New repo: `.gitignore` is created with the security-critical
+    /// `.coral/` + `.wiki/.bootstrap-*` entries.
+    #[test]
+    fn fr_onb_34_gitignore_created_with_security_entries() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        let security_patterns = [
+            ".coral/",
+            ".wiki/.bootstrap-state.json",
+            ".wiki/.bootstrap.lock",
+        ];
+        let changed = append_gitignore_patterns(&p, &security_patterns).unwrap();
+        assert!(changed);
+        let body = std::fs::read_to_string(&p).unwrap();
+        for pat in security_patterns {
+            assert!(body.contains(pat), ".gitignore must contain `{pat}`");
+        }
+    }
+
+    /// Existing .gitignore: security-critical entries appended without
+    /// touching user content.
+    #[test]
+    fn fr_onb_34_gitignore_appends_security_entries() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        std::fs::write(&p, "target/\nnode_modules/\n").unwrap();
+        let _ = append_gitignore_patterns(
+            &p,
+            &[
+                ".coral/",
+                ".wiki/.bootstrap-state.json",
+                ".wiki/.bootstrap.lock",
+            ],
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("target/"));
+        assert!(body.contains("node_modules/"));
+        assert!(body.contains(".coral/"));
+        assert!(body.contains(".wiki/.bootstrap-state.json"));
+    }
+
+    /// Second call is a no-op (entries already present).
+    #[test]
+    fn fr_onb_34_gitignore_security_entries_idempotent() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        let security_patterns = [
+            ".coral/",
+            ".wiki/.bootstrap-state.json",
+            ".wiki/.bootstrap.lock",
+        ];
+        let _ = append_gitignore_patterns(&p, &security_patterns).unwrap();
+        let changed_again = append_gitignore_patterns(&p, &security_patterns).unwrap();
+        assert!(!changed_again, "second append must be a no-op");
+    }
+
+    /// We NEVER remove user entries — even ones that look like they
+    /// belong to Coral. The append-only contract is load-bearing.
+    #[test]
+    fn fr_onb_34_gitignore_never_removes_user_entries() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join(".gitignore");
+        // User wrote their own .coral/ pattern with a trailing comment.
+        std::fs::write(&p, ".coral/sessions/important.jsonl\n# my notes\n").unwrap();
+        let _ = append_gitignore_patterns(&p, &[".coral/"]).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.contains(".coral/sessions/important.jsonl"),
+            "user line must survive"
+        );
+        assert!(body.contains("# my notes"), "user comment must survive");
+        assert!(body.contains(".coral/"), "our pattern must be appended");
+    }
+
+    // ------------------------------------------------------------------
+    // FR-ONB-25: CLAUDE.md append-safe + size guard
+    // ------------------------------------------------------------------
+
+    /// CLAUDE.md absent → write the full template.
+    #[test]
+    fn fr_onb_25_claude_md_created_when_missing() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        let outcome = apply_claude_md(&p, CLAUDE_MD_TEMPLATE, false).unwrap();
+        assert_eq!(outcome, ClaudeMdOutcome::Created);
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("## Coral routing"));
+        // Sanity: the fallback line FR-ONB-25 promises is present.
+        assert!(body.contains("/coral:coral-doctor"));
+    }
+
+    /// CLAUDE.md short + no section → append.
+    #[test]
+    fn fr_onb_25_claude_md_appended_when_short_and_missing_section() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        std::fs::write(&p, "# Project rules\n\nUse 4-space indentation.\n").unwrap();
+        let outcome = apply_claude_md(&p, CLAUDE_MD_TEMPLATE, false).unwrap();
+        assert_eq!(outcome, ClaudeMdOutcome::Appended);
+        let body = std::fs::read_to_string(&p).unwrap();
+        // User content survives.
+        assert!(body.contains("Use 4-space indentation."));
+        assert!(body.contains("## Coral routing"));
+        // The user's existing block precedes our append.
+        let user_idx = body.find("Use 4-space indentation.").unwrap();
+        let routing_idx = body.find("## Coral routing").unwrap();
+        assert!(user_idx < routing_idx, "user content must come first");
+    }
+
+    /// CLAUDE.md long + no section + no --yes → skip + warn.
+    #[test]
+    fn fr_onb_25_claude_md_skipped_when_long_and_no_yes() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        let long = "line\n".repeat(CLAUDE_MD_SIZE_GUARD_LINES + 10);
+        std::fs::write(&p, &long).unwrap();
+        let outcome = apply_claude_md(&p, CLAUDE_MD_TEMPLATE, false).unwrap();
+        assert_eq!(outcome, ClaudeMdOutcome::SkippedTooLong);
+        // File on disk is unchanged.
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(body, long);
+        assert!(
+            !body.contains("## Coral routing"),
+            "skip path must NOT append"
+        );
+    }
+
+    /// CLAUDE.md long + no section + --yes → force append.
+    #[test]
+    fn fr_onb_25_claude_md_force_append_with_yes() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        let long = "line\n".repeat(CLAUDE_MD_SIZE_GUARD_LINES + 10);
+        std::fs::write(&p, &long).unwrap();
+        let outcome = apply_claude_md(&p, CLAUDE_MD_TEMPLATE, true).unwrap();
+        assert_eq!(outcome, ClaudeMdOutcome::Appended);
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(body.contains("## Coral routing"));
+        // User content survives.
+        assert!(body.starts_with("line\n"));
+    }
+
+    /// CLAUDE.md already has section → no-op regardless of length or
+    /// `--yes` flag. We never re-append the same section.
+    #[test]
+    fn fr_onb_25_claude_md_noop_when_section_present() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        let original = "# Notes\n\n## Coral routing\n\nalready here\n";
+        std::fs::write(&p, original).unwrap();
+        let outcome = apply_claude_md(&p, CLAUDE_MD_TEMPLATE, false).unwrap();
+        assert_eq!(outcome, ClaudeMdOutcome::AlreadyHasSection);
+        // File on disk unchanged byte-for-byte.
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(body, original);
+
+        // And with --yes it's still a no-op.
+        let outcome = apply_claude_md(&p, CLAUDE_MD_TEMPLATE, true).unwrap();
+        assert_eq!(outcome, ClaudeMdOutcome::AlreadyHasSection);
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(body, original);
+    }
+
+    /// We NEVER overwrite the user's content — only ever append or
+    /// no-op. This test pathologically tries an "append" against a
+    /// short file and confirms the leading content is byte-stable.
+    #[test]
+    fn fr_onb_25_claude_md_never_overwrites_user_content() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("CLAUDE.md");
+        let user = "USER WRITTEN CONTENT line 1\nUSER WRITTEN CONTENT line 2\n";
+        std::fs::write(&p, user).unwrap();
+        let _ = apply_claude_md(&p, CLAUDE_MD_TEMPLATE, false).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            body.starts_with(user),
+            "user content must be the prefix of the post-append file:\n{body}"
+        );
+    }
+
+    /// Case-insensitive match: `## CORAL ROUTING`, `## Coral Routing`,
+    /// `##   coral routing` (with leading whitespace) all detected.
+    #[test]
+    fn fr_onb_25_section_detection_is_case_insensitive_and_whitespace_tolerant() {
+        assert!(claude_md_has_routing_section("## Coral routing\n"));
+        assert!(claude_md_has_routing_section("## CORAL ROUTING\n"));
+        assert!(claude_md_has_routing_section("## coral routing\n"));
+        assert!(claude_md_has_routing_section("   ## Coral Routing\n"));
+        assert!(!claude_md_has_routing_section("# Coral routing\n"));
+        assert!(!claude_md_has_routing_section("Just text.\n"));
+    }
+
+    // ------------------------------------------------------------------
+    // Week 3 validator B2: non-git directory must fail loudly, not
+    // fall back to a zero SHA.
+    // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // BACKLOG #12 L2 (v0.40.2): claude-on-PATH detection helper
+    // ------------------------------------------------------------------
+
+    /// `claude_on_path()` returns true when a file named `claude` (or
+    /// `claude.exe` on Windows) is found in any `$PATH` entry. We mock
+    /// PATH to a tempdir holding a fake binary so the assertion is
+    /// hermetic.
+    #[test]
+    fn claude_on_path_detects_binary() {
+        let _lock = coral_runner::test_script_lock();
+        let prior_path = std::env::var_os("PATH");
+        let dir = TempDir::new().unwrap();
+        let exe_name = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        let fake = dir.path().join(exe_name);
+        std::fs::write(&fake, b"#!/bin/sh\necho mock\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut p = std::fs::metadata(&fake).unwrap().permissions();
+            p.set_mode(0o755);
+            std::fs::set_permissions(&fake, p).unwrap();
+        }
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+        }
+        let detected = claude_on_path();
+        // Restore env BEFORE the assertion so a panic doesn't leak state.
+        unsafe {
+            match prior_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(detected, "fake `claude` in PATH must be detected");
+    }
+
+    /// Negative case: empty PATH → no detection.
+    #[test]
+    fn claude_on_path_returns_false_when_absent() {
+        let _lock = coral_runner::test_script_lock();
+        let prior_path = std::env::var_os("PATH");
+        let dir = TempDir::new().unwrap();
+        // Tempdir is empty — no `claude` binary in it.
+        unsafe {
+            std::env::set_var("PATH", dir.path());
+        }
+        let detected = claude_on_path();
+        unsafe {
+            match prior_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        assert!(!detected, "empty PATH must report no claude");
+    }
+
+    /// `coral init` outside a git repo returns an actionable error
+    /// rather than silently materialising an index with `last_commit =
+    /// 0x40`. Verifying via the public `run` would require holding the
+    /// process cwd lock for this binary, so we test the underlying
+    /// `gitdiff::head_sha` contract instead and trust the wiring in
+    /// `run` (which now propagates the error verbatim).
+    #[test]
+    fn b2_head_sha_errors_in_non_git_tempdir() {
+        let dir = TempDir::new().unwrap();
+        let err = coral_core::gitdiff::head_sha(dir.path())
+            .expect_err("head_sha must error in a non-git tempdir");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("git"),
+            "error must mention git so the run() wrapper can render its `git init` hint: {msg}"
+        );
+    }
+}

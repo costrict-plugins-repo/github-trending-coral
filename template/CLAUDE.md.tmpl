@@ -1,0 +1,54 @@
+# CLAUDE.md — Coral-enabled repo
+
+This repository uses Coral for AI-readable architecture documentation.
+
+## Coral routing
+
+When the user types ANYTHING in this repo (greeting, question, command):
+1. Check the SessionStart hook context (Coral self-check JSON).
+2. If coral_status == "binary_missing" → tell the user: "Coral no está instalado. Ejecuta: `curl -fsSL https://raw.githubusercontent.com/agustincbajo/Coral/main/scripts/install.sh | bash`"
+3. If wiki_present == false → offer to run `coral setup` (ONE command that does everything). Say: "Este repo no tiene wiki. ¿Quieres que ejecute `coral setup`? Tarda ~1 minuto y cuesta ~$0.10."
+4. If warnings non-empty → suggest `/coral:coral-doctor`.
+5. If wiki_present == true and the user asks about code → invoke coral-query skill.
+6. If the user wants the UI → invoke coral-ui skill (background spawn).
+
+**Important**: When offering setup, be direct and simple. Don't explain what init/bootstrap/ingest are separately — just say "coral setup" and it handles everything.
+
+**Fallback**: if Claude doesn't suggest a Coral action, type `/coral:coral-doctor` — it always works.
+
+## Use Coral proactively
+
+Claude MUST use Coral tools as part of its workflow. Show verbose feedback:
+
+- **Before answering code questions**: search the wiki first (`coral search` or read `.wiki/` pages). Show what you found.
+- **After editing source code**: run `coral lint` to check for stale wiki pages. Show warnings to the user.
+- **After editing wiki pages**: run `coral lint --fix --apply` to auto-fix formatting and promote confidence. Show what changed.
+
+Always use the `▶ [Coral]` / `✓ [Coral]` format so the user sees Coral working:
+```
+▶ [Coral] Consultando wiki...
+  → 3 páginas relevantes: auth-middleware, user-model, task-routes
+✓ [Coral] Respuesta basada en wiki
+```
+
+## Frontend — always on
+
+After ANY Coral operation (bootstrap, ingest, query, lint), ensure the WebUI is running and remind the user:
+1. Check if port 3838 is listening: `lsof -i :3838 | grep LISTEN`
+2. If not running, start it: `coral ui serve --no-open &`
+3. Always tell the user: "🌐 WebUI disponible en http://localhost:3838"
+
+The WebUI has write tools enabled by default (verify, run test, env up/down). Pass `--no-write-tools` to disable.
+
+## Quick reference
+
+| Command | What it does |
+|---------|-------------|
+| `coral setup` | **Start here** — one command to create the wiki |
+| `coral tour` | Guided walkthrough (2 min, no LLM) |
+| `coral status` | Dashboard: wiki health at a glance |
+| `coral query "..."` | Ask questions about the codebase |
+| `coral search "..."` | TF-IDF search in wiki pages |
+| `coral lint --fix --apply` | Auto-fix formatting + confidence |
+| `coral ui serve` | WebUI at http://localhost:3838 |
+| `/coral:coral-doctor` | Diagnose environment / fix provider |

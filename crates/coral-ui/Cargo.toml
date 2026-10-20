@@ -1,0 +1,49 @@
+[package]
+name = "coral-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Coral WebUI — REST API + embedded SPA assets."
+
+[dependencies]
+tiny_http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml_ng = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+include_dir = { workspace = true }
+signal-hook = { workspace = true }
+mime_guess = { workspace = true }
+coral-core = { workspace = true }
+coral-runner = { workspace = true }
+# v0.36 hardening: runtime decompression for the rare client that
+# advertises `Accept-Encoding: identity` after build.rs dropped the
+# heavy raw bundle (>=100 KiB) from `include_dir!`. Without these the
+# static-asset handler would 404 such requests instead of serving the
+# decoded bytes. flate2 has no system-zlib dependency by default
+# (uses miniz_oxide pure-Rust backend), so the single-binary
+# distribution invariant holds.
+flate2 = "1"
+brotli = "8"
+
+[build-dependencies]
+# v0.35 Phase C (P-H1): pre-compress the embedded SPA bundle so the
+# static-asset handler can serve `.gz` / `.br` siblings when the
+# client advertises support.
+flate2 = "1"
+brotli = "8"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# v0.35 Phase C — inherit workspace clippy lints (unwrap/expect/panic
+# = warn). Surfaces panic-risk sites without breaking CI.
+[lints]
+workspace = true

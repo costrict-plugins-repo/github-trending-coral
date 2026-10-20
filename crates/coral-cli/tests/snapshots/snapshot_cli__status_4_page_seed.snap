@@ -1,0 +1,22 @@
+---
+source: crates/coral-cli/tests/snapshot_cli.rs
+expression: stdout
+---
+# Wiki status
+
+- Wiki: `.wiki`
+- Last commit: `[COMMIT_SHA]`
+- Pages: 4
+- Lint: Critical: 0 | Warning: 9 | Info: 0
+- Stats: 4 pages, avg confidence 0.74, 1 orphan candidate(s)
+
+## Recent log
+
+- [TIMESTAMP] `init`: wiki initialized
+
+## Code Intelligence
+
+- Code index:    not built (run `coral index`)
+- Code graph:    not built (run `coral graph`)
+- Search index:  not built (run `coral find` to auto-build)
+- Embeddings:    not configured (run `coral embed --provider voyage` to enable)

@@ -1,0 +1,85 @@
+[package]
+name = "coral-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Coral core types: frontmatter, wikilinks, pages, index, log."
+
+[features]
+default = []
+pgvector = []
+tantivy = []
+# v0.36 ADR-0012 baseline. Empty marker feature consumed only by the
+# `allocator` bench (cfg-gates the choice of #[global_allocator]).
+# No code outside `benches/allocator.rs` reads it.
+system_alloc = []
+
+[dependencies]
+serde = { workspace = true }
+serde_yaml_ng = { workspace = true }
+serde_json = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+rayon = { workspace = true }
+chrono = { workspace = true }
+ahash = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+fs4 = { workspace = true, features = ["sync"] }
+toml = { workspace = true }
+postcard = { workspace = true }
+# Cryptographic hash for the BM25 search-index `content_hash` cache key.
+# Replaces the previous 64-bit SipHash (`DefaultHasher`) so the doc
+# comment ("SHA-256 of all page bodies …") matches the implementation
+# and the cache-validity gate gets cryptographic collision resistance.
+sha2 = "0.10"
+# v0.35 Phase C: `auth::mint_bearer_token` (hoisted from coral-cli) wraps
+# `rand::random::<[u8; 32]>()` so both the MCP HTTP transport mint path
+# and the WebUI auto-token path share one CSPRNG-backed helper. Same
+# workspace pin coral-cli + coral-mcp already use — no new transitives.
+rand = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = "0.5"
+proptest = { workspace = true }
+# v0.36 ADR-0012 baseline: criterion bench harness toggles between
+# mimalloc (the production allocator on `coral` since v0.24.0) and
+# the system allocator at compile time. The `system_alloc` feature
+# below flips it; without the feature, mimalloc is wired in via
+# `#[global_allocator]` at the top of `benches/allocator.rs`.
+mimalloc = { workspace = true }
+
+[[bench]]
+name = "search_bench"
+harness = false
+
+[[bench]]
+name = "wikilinks_bench"
+harness = false
+
+[[bench]]
+name = "frontmatter_bench"
+harness = false
+
+[[bench]]
+name = "walk_bench"
+harness = false
+
+# v0.36 ADR-0012 baseline. Benches three representative workloads
+# (TF-IDF, wiki page parse, OpenAPI proptest gen) twice — once with
+# mimalloc (default), once with the system allocator (`cargo bench
+# --bench allocator --features system_alloc`). Results captured to
+# `docs/bench/MIMALLOC-BASELINE-2026-05-13.md`.
+[[bench]]
+name = "allocator"
+harness = false
+
+# v0.35 Phase C — inherit workspace clippy lints (unwrap/expect/panic
+# = warn). Surfaces panic-risk sites without breaking CI.
+[lints]
+workspace = true

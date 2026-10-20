@@ -1,0 +1,294 @@
+//! Shared HTTP-auth primitives for Coral's two HTTP-speaking surfaces
+//! (`coral ui serve` and `coral mcp serve --transport http`).
+//!
+//! v0.35 SEC-01 / CP-3: pre-fix only `coral ui` enforced a bearer token;
+//! `coral mcp serve --transport http` had only an Origin allowlist and
+//! the 127.0.0.1 default bind. A user who followed the `--bind 0.0.0.0`
+//! warning would expose an unauthenticated tool-execution endpoint on
+//! the LAN. The two surfaces had near-identical `validate_host` /
+//! `require_bearer` / `constant_time_eq` logic; extracting it here
+//! makes the MCP HTTP transport reuse the same checks the WebUI relies
+//! on (and gives both crates one set of tests to update when the rules
+//! evolve).
+//!
+//! The module is transport-agnostic: it doesn't depend on `tiny_http`
+//! or any specific request type, so the two callers can adapt their
+//! own header iteration without forcing a shared HTTP type. Callers
+//! pass byte slices for `expected` / `provided` tokens and string
+//! slices for header values.
+
+/// Loopback-ish bind addresses that are safe to serve without a token.
+/// Matches the union of names IPv4 / IPv6 stacks recognize as the
+/// local machine (the `[::1]` and bracketed forms cover what HTTP
+/// `Host` headers actually carry for IPv6 loopback).
+pub fn is_loopback(bind: &str) -> bool {
+    matches!(bind, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// Constant-time byte-slice equality. Avoids early-exit timing leaks
+/// when comparing user-supplied tokens against the configured one —
+/// the loop visits every byte even when the first differs, so an
+/// attacker can't learn the matched prefix from response latency.
+///
+/// Returns `false` immediately on length mismatch (the length itself
+/// is not a secret in our threat model — tokens are minted as
+/// fixed-width 256-bit hex strings, so all valid tokens share a
+/// length).
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Parse a `Bearer <token>` header value, accepting both canonical
+/// `Bearer` and lowercase `bearer` casings. Returns the token slice
+/// when the prefix matches, `None` otherwise.
+///
+/// This is split out from `verify_bearer` so callers that want to
+/// 401-with-a-custom-error on bad shape can do so without duplicating
+/// the prefix-strip logic.
+pub fn extract_bearer_token(header_value: &str) -> Option<&str> {
+    let trimmed = header_value.trim();
+    trimmed
+        .strip_prefix("Bearer ")
+        .or_else(|| trimmed.strip_prefix("bearer "))
+}
+
+/// Verify a presented `Authorization: Bearer <token>` header against
+/// the expected token in constant time.
+///
+/// Returns:
+/// - `Ok(())` when the prefix is correct and the token matches.
+/// - `Err(BearerAuthError::MissingHeader)` when `header_value` is
+///   `None` (no Authorization header sent).
+/// - `Err(BearerAuthError::MalformedHeader)` when the header is
+///   present but doesn't start with `Bearer ` / `bearer `.
+/// - `Err(BearerAuthError::TokenMismatch)` when the prefix is correct
+///   but the token doesn't match the expected value.
+///
+/// The three error variants let the caller pick how granular the 401
+/// response should be — the MCP transport collapses everything into
+/// a single `401 Unauthorized` (clients don't need to know whether
+/// they sent the wrong shape or the wrong value), while the WebUI
+/// surfaces distinct `ApiError` variants for the same conditions so
+/// the SPA can show a tailored error toast.
+pub fn verify_bearer(
+    header_value: Option<&str>,
+    expected_token: &[u8],
+) -> Result<(), BearerAuthError> {
+    let header_value = header_value.ok_or(BearerAuthError::MissingHeader)?;
+    let token = extract_bearer_token(header_value).ok_or(BearerAuthError::MalformedHeader)?;
+    if constant_time_eq(token.as_bytes(), expected_token) {
+        Ok(())
+    } else {
+        Err(BearerAuthError::TokenMismatch)
+    }
+}
+
+/// Mint a 256-bit hex-encoded bearer token from the OS CSPRNG.
+///
+/// Returns 64 lower-case hex chars (32 random bytes = 256 bits of
+/// entropy). `rand::random` routes to `OsRng` on every supported
+/// platform — `getrandom(2)` on Linux, `BCryptGenRandom` on Windows,
+/// `SecRandomCopyBytes` on macOS — so the token is unguessable even
+/// to an attacker who can observe the server's wall-clock to the
+/// nanosecond.
+///
+/// v0.35 Phase C: hoisted from byte-for-byte duplicates in
+/// `coral-cli/src/commands/mcp.rs` (CP-3) and
+/// `coral-cli/src/commands/ui.rs` (CP-4). Both surfaces now share one
+/// definition + one set of tests, so a future entropy bump (e.g. 384
+/// bits if a downstream auditor asks) only has to be made here.
+///
+/// # Panics
+///
+/// Never panics under normal operation. The internal hex formatter
+/// uses `write!` to a `String`, which can only fail on OOM — by which
+/// point the process is already going down.
+pub fn mint_bearer_token() -> String {
+    let bytes: [u8; 32] = rand::random();
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write as _;
+        // `write!` to a String only fails on OOM, which would already
+        // have killed the process — `expect` is appropriate.
+        #[allow(
+            clippy::expect_used,
+            reason = "write! to String is infallible except on OOM"
+        )]
+        {
+            write!(&mut s, "{b:02x}").expect("hex format must not fail");
+        }
+    }
+    s
+}
+
+/// Failure modes for [`verify_bearer`]. The three variants let callers
+/// surface different error messages without re-implementing the check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BearerAuthError {
+    /// No `Authorization` header was sent.
+    MissingHeader,
+    /// Header was present but didn't start with `Bearer ` / `bearer `.
+    MalformedHeader,
+    /// Header was well-formed but the token didn't match.
+    TokenMismatch,
+}
+
+impl BearerAuthError {
+    /// Human-readable label suitable for inclusion in a 401 response
+    /// body. Stable strings — the MCP transport tests pin them.
+    pub fn label(self) -> &'static str {
+        match self {
+            BearerAuthError::MissingHeader => "missing Authorization header",
+            BearerAuthError::MalformedHeader => "Authorization header must start with 'Bearer '",
+            BearerAuthError::TokenMismatch => "invalid bearer token",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loopback_aliases_recognized() {
+        assert!(is_loopback("127.0.0.1"));
+        assert!(is_loopback("localhost"));
+        assert!(is_loopback("::1"));
+        assert!(is_loopback("[::1]"));
+        assert!(!is_loopback("0.0.0.0"));
+        assert!(!is_loopback("192.168.1.1"));
+        assert!(!is_loopback(""));
+    }
+
+    #[test]
+    fn constant_time_eq_basic_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn extract_bearer_accepts_both_casings() {
+        assert_eq!(extract_bearer_token("Bearer xyz"), Some("xyz"));
+        assert_eq!(extract_bearer_token("bearer xyz"), Some("xyz"));
+        assert_eq!(extract_bearer_token("  Bearer xyz  "), Some("xyz"));
+        // No prefix → None
+        assert_eq!(extract_bearer_token("xyz"), None);
+        // Wrong prefix → None
+        assert_eq!(extract_bearer_token("Basic xyz"), None);
+        // Empty → None
+        assert_eq!(extract_bearer_token(""), None);
+    }
+
+    #[test]
+    fn verify_bearer_happy_path() {
+        assert_eq!(verify_bearer(Some("Bearer secret"), b"secret"), Ok(()));
+        assert_eq!(verify_bearer(Some("bearer secret"), b"secret"), Ok(()));
+    }
+
+    #[test]
+    fn verify_bearer_missing_header() {
+        assert_eq!(
+            verify_bearer(None, b"secret"),
+            Err(BearerAuthError::MissingHeader)
+        );
+    }
+
+    #[test]
+    fn verify_bearer_malformed_header() {
+        assert_eq!(
+            verify_bearer(Some("Basic abc"), b"secret"),
+            Err(BearerAuthError::MalformedHeader)
+        );
+        assert_eq!(
+            verify_bearer(Some("nothing"), b"secret"),
+            Err(BearerAuthError::MalformedHeader)
+        );
+    }
+
+    #[test]
+    fn verify_bearer_token_mismatch() {
+        assert_eq!(
+            verify_bearer(Some("Bearer wrong"), b"secret"),
+            Err(BearerAuthError::TokenMismatch)
+        );
+        // Length-mismatch is still a TokenMismatch — exposing
+        // "wrong length" vs "wrong bytes" would leak the secret's
+        // length, which is fine for our threat model but no reason
+        // to distinguish.
+        assert_eq!(
+            verify_bearer(Some("Bearer short"), b"a-much-longer-secret"),
+            Err(BearerAuthError::TokenMismatch)
+        );
+    }
+
+    /// v0.35 Phase C — minted tokens are 64 lower-case hex chars
+    /// (256 bits of entropy) and consecutive mints differ. Mirrors
+    /// the CP-3 / CP-4 tests that used to live separately in coral-cli;
+    /// pinning the shape here means both callsites share one contract.
+    #[test]
+    fn mint_bearer_token_shape_and_uniqueness() {
+        let a = mint_bearer_token();
+        let b = mint_bearer_token();
+        assert_eq!(a.len(), 64, "expected 256 bits = 64 hex chars: {a}");
+        assert_eq!(b.len(), 64, "expected 256 bits = 64 hex chars: {b}");
+        assert!(
+            a.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "token must be lower-case hex only: {a}"
+        );
+        assert!(
+            b.bytes()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "token must be lower-case hex only: {b}"
+        );
+        assert_ne!(a, b, "two consecutive mints collided");
+    }
+
+    /// v0.35 Phase C — distribution check: 1024 consecutive mints
+    /// must all be unique (collision probability for 256-bit tokens is
+    /// astronomically low — a collision here means rand is broken).
+    #[test]
+    fn mint_bearer_token_distribution_is_unique_across_many_calls() {
+        let n = 1024;
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(n);
+        for _ in 0..n {
+            let t = mint_bearer_token();
+            assert_eq!(t.len(), 64, "non-64-char mint: {t}");
+            assert!(
+                seen.insert(t),
+                "collision in {n} 256-bit mints — rand is broken"
+            );
+        }
+        assert_eq!(seen.len(), n);
+    }
+
+    #[test]
+    fn bearer_auth_error_labels_are_stable() {
+        // These strings are part of the wire contract for the MCP
+        // 401 body — the e2e tests pin them. Pin here too so a
+        // rename in this enum has to come through code review.
+        assert_eq!(
+            BearerAuthError::MissingHeader.label(),
+            "missing Authorization header"
+        );
+        assert_eq!(
+            BearerAuthError::MalformedHeader.label(),
+            "Authorization header must start with 'Bearer '"
+        );
+        assert_eq!(
+            BearerAuthError::TokenMismatch.label(),
+            "invalid bearer token"
+        );
+    }
+}

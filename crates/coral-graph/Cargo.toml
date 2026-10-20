@@ -1,0 +1,24 @@
+[package]
+name = "coral-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Call graphs and dependency graphs from parsed symbols (coral-index)"
+
+[features]
+default = ["bin-format"]
+bin-format = ["dep:bincode"]
+
+[dependencies]
+petgraph = "0.7"
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { version = "1", optional = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

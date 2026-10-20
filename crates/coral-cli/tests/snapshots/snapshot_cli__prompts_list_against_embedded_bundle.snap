@@ -1,0 +1,20 @@
+---
+source: crates/coral-cli/tests/snapshot_cli.rs
+expression: stdout
+---
+# Prompts
+
+| Name | Source |
+|------|--------|
+| bootstrap | embedded (bootstrap.md) |
+| ingest | embedded (ingest.md) |
+| query | embedded (query.md) |
+| lint-semantic | embedded (lint-semantic.md) |
+| consolidate | embedded (consolidate.md) |
+| onboard | fallback (in code) |
+| qa-pairs | embedded (qa-pairs.md) |
+| lint-auto-fix | embedded (lint-auto-fix.md) |
+| lint-auto-fix-broken-wikilink | embedded (lint-auto-fix-broken-wikilink.md) |
+| lint-auto-fix-low-confidence | embedded (lint-auto-fix-low-confidence.md) |
+| diff-semantic | embedded (diff-semantic.md) |
+| lint-suggest-sources | embedded (lint-suggest-sources.md) |
